@@ -48,20 +48,44 @@ Double-click **`run.bat`**, then drag a rectangle around the VM window. Or from 
 .venv/Scripts/python.exe translator.py --no-overlay   # only print translations in the console
 ```
 
+### Toolbar
+
+A small floating toolbar appears just above the translated area (drag it anywhere by its
+`⠿` grip). Clicking it does not take keyboard focus away from the VM.
+
+| Button | Action |
+|---|---|
+| `●` | status: blue = loading models, green = translating, amber = paused |
+| `❚❚ Pause` / `▶ Resume` | stop / restart translating (shows the original Chinese while paused) |
+| `⤢ Resize` | pick a new area: the screen dims, drag a new rectangle (`Esc` keeps the old one) |
+| `A−` `100%` `A+` | translation font size, 50%–300%. Above 100% the English may extend past the original text or wrap |
+| `↕−` `1.0×` `↕+` | line spacing: distance between translated rows (and wrapped lines), 1.0×–3.0× the text height |
+| `✕` | quit |
+
+Translations never cover each other: when a bigger font, a wrapped phrase or more line spacing
+needs more height than the original line, the rows below are pushed down (a whole row at a time,
+so table columns stay aligned). Rows pushed past the bottom of the area keep going below it.
+
 | Hotkey | Action |
 |---|---|
-| `Ctrl+Alt+Shift+T` | pause / resume (shows the original Chinese) |
+| `Ctrl+Alt+Shift+T` | pause / resume |
 | `Ctrl+Alt+Shift+Q` | quit (`Ctrl+C` in the console also works) |
 
-If the VM window has keyboard focus it may capture the hotkeys; click outside it first.
+If the VM window has keyboard focus it may capture the hotkeys; use the toolbar instead.
 
-Other options: `--interval` (seconds between screen checks, default 0.25), `--min-score`
-(OCR confidence, default 0.6), `--opacity` (0.2–1). See `--help`.
+Other options: `--font-scale` (starting font size, e.g. `1.5`), `--line-spacing` (starting line
+spacing, e.g. `1.5`), `--no-toolbar`, `--interval`
+(seconds between screen checks, default 0.25), `--min-score` (OCR confidence, default 0.6),
+`--opacity` (0.2–1). See `--help`.
+
+The overlay and toolbar are hidden from screenshots and screen sharing (that is how the
+translator avoids reading its own English).
 
 ## How it works
 
 1. Grabs the selected area of the screen; if nothing changed since last time, does nothing.
 2. Detects text boxes; only boxes with new pixels go through text recognition (cached).
+   Pieces of one line that the detector split apart are joined back together.
 3. Translates new Chinese lines (cached), using `glossary.txt` first for exact matches.
 4. Draws each translation over its original line, in a window that is click-through and
    hidden from screen capture (so it never reads its own English).
