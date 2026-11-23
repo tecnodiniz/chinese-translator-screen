@@ -1,0 +1,7 @@
+# Offline realtime screen translator (Windows Python 3.13). Everything runs locally.
+mss==10.2.0             # screen capture
+numpy==2.5.5
+rapidocr==3.10.0        # OCR (PP-OCR models ship inside the package)
+onnxruntime==1.32.0     # runs the OCR models
+ctranslate2==4.9.1      # runs the translation model (models/opus-mt-zho-eng)
+sentencepiece==0.2.3    # tokenizer for the translation model

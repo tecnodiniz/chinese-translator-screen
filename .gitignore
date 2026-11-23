@@ -1,0 +1,38 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Offline wheel downloads (see README: pip download ... -d wheels)
+wheels/
+
+# Translation model: too big for git, downloaded and converted locally (see README: Setup)
+models/
+
+# Python bytecode and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and scratch output
+*.log
+*.tmp
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*:Zone.Identifier
+
+# Claude Code local settings
+.claude/settings.local.json

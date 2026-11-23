@@ -1,0 +1,18 @@
+# Glossary: exact on-screen text = English translation.
+# A line of Chinese that matches one of these exactly uses this translation instead of the model.
+# Add your own corrections (one per line, UTF-8). Restart the translator after editing.
+
+# Single UI words the model gets wrong out of context:
+文件 = File
+否 = No
+是 = Yes
+注销 = Log out
+登录 = Log in
+首页 = Home
+打开 = Open
+返回 = Back
+上一步 = Back
+开始 = Start
+权限 = Permissions
+服务器 = Server
+提示 = Notice
