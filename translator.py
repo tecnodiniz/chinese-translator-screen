@@ -17,7 +17,7 @@ Run it with the project's Windows venv (from WSL: .venv/Scripts/python.exe trans
     translator.py --no-overlay   only print the translations in the console
 
 A floating toolbar has pause/resume, resize (choose a new area), font size -/+,
-line spacing -/+ and quit.
+line spacing -/+, screenshot (area with translations -> PNG + clipboard) and quit.
 Hotkeys: Ctrl+Alt+Shift+T pause/resume, Ctrl+Alt+Shift+Q quit (Ctrl+C in the console also quits).
 A VM window that has keyboard focus may swallow the hotkeys - click outside it first.
 """
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import math
 import queue
 import re
 import signal
@@ -36,12 +37,14 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_MODEL = HERE / "models" / "opus-mt-zho-eng"
 GLOSSARY = HERE / "glossary.txt"
+DEFAULT_SCREENSHOT_DIR = HERE / "screenshots"
 IS_WINDOWS = sys.platform == "win32"
 CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
 TRANSPARENT_KEY = "#010203"  # overlay pixels of exactly this colour are see-through
@@ -119,7 +122,7 @@ class ScreenOCR:
             try:
                 rec = self.engine.recognize_txt(crops)
                 results = list(zip(rec.txts, rec.scores))
-            except Exception:  # RapidOCR raises when nothing at all could be recognised
+            except Exception:  # noqa: BLE001 - RapidOCR raises when nothing at all could be recognised
                 results = [("", 0.0)] * len(crops)
             for key, (text, score) in zip(unseen, results):
                 self.cache[key] = (text.strip(), float(score))
@@ -173,6 +176,13 @@ _FULLWIDTH = str.maketrans({
 # The model sometimes prepends a training label such as ">>cmn_Hans<<", decoded as "⁇ cmn_Hans ⁇".
 _LABEL = re.compile(r"⁇\s*[\w-]*\s*⁇|⁇")
 _SENTENCE_END = ("。", ".", "！", "!", "？", "?")
+# Only Chinese is translated. Non-Chinese stretches that contain a letter or digit - product names,
+# code, paths, URLs, e-mails, versions ("gitlab", "config.yaml", "v2.3.1") - are swapped for
+# placeholders the model copies faithfully (X1, X2, ...) and put back exactly as written.
+_NOT_CHINESE = r"[^\s\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uffef]+"
+_KEEP = re.compile(rf"{_NOT_CHINESE}(?:\s+{_NOT_CHINESE})*")
+_ALNUM = re.compile(r"[A-Za-z0-9]")
+_PLACEHOLDER = re.compile(r"\bX(\d+)\b")
 
 
 def load_glossary(path: Path) -> dict[str, str]:
@@ -190,7 +200,8 @@ def load_glossary(path: Path) -> dict[str, str]:
 
 class OfflineTranslator:
     """Chinese -> English with a local OPUS-MT model (CTranslate2, int8, CPU).
-    Lines that exactly match a glossary entry use the glossary instead of the model."""
+    Lines that exactly match a glossary entry use the glossary instead of the model.
+    Only the Chinese is translated: everything else in a line is kept exactly as written."""
 
     def __init__(self, model_dir: Path, glossary: dict[str, str] | None = None):
         import ctranslate2
@@ -210,15 +221,62 @@ class OfflineTranslator:
         out: list[str | None] = [self.glossary.get(t.strip()) for t in texts]
         todo = [i for i, en in enumerate(out) if en is None]
         if todo:
-            batch = [self.sp_src.encode(self._normalize(texts[i]), out_type=str) for i in todo]
-            results = self.model.translate_batch(batch, beam_size=4, max_decoding_length=256, max_batch_size=32)
-            for i, res in zip(todo, results):
-                en = _LABEL.sub("", self.sp_tgt.decode(res.hypotheses[0])).strip()
-                # Short UI labels should not get a full stop: "确定" -> "OK", not "OK."
-                if en.endswith(".") and not en.endswith("..") and not texts[i].rstrip().endswith(_SENTENCE_END):
-                    en = en[:-1]
+            protected = [self._protect(texts[i]) for i in todo]
+            candidates = self._run_model([p for p, _ in protected], alternatives=4)
+            failed = []
+            for i, (_, kept), options in zip(todo, protected, candidates):
+                # Best translation in which every placeholder survived exactly once.
+                out[i] = next((en for option in options if (en := self._restore(option, kept)) is not None), None)
+                if out[i] is None:
+                    failed.append(i)
+            # Very rare: no candidate kept the placeholders. Translate just the Chinese pieces instead.
+            for i, en in zip(failed, self._translate_pieces([texts[i] for i in failed])):
                 out[i] = en
         return out
+
+    @staticmethod
+    def _protect(text: str) -> tuple[str, list[str]]:
+        """Swap non-Chinese words/code for placeholders: "在gitlab上创建项目" -> "在X1上创建项目"."""
+        kept: list[str] = []
+
+        def swap(m: re.Match) -> str:
+            if not _ALNUM.search(m.group(0)):
+                return m.group(0)  # punctuation only: leave it to the model
+            kept.append(m.group(0))
+            return f"X{len(kept)}"
+
+        return _KEEP.sub(swap, text), kept
+
+    @staticmethod
+    def _restore(en: str, kept: list[str]) -> str | None:
+        """Put the original text back; None if the placeholders did not survive exactly once each."""
+        if sorted(int(n) for n in _PLACEHOLDER.findall(en)) != list(range(1, len(kept) + 1)):
+            return None
+        return _PLACEHOLDER.sub(lambda m: kept[int(m.group(1)) - 1], en)
+
+    def _translate_pieces(self, texts: list[str]) -> list[str]:
+        """Fallback: translate only the Chinese stretches; everything else stays in place."""
+        pieces = [[p.strip() for p in re.split(f"({_KEEP.pattern})", t) if p.strip()] for t in texts]
+        chinese = [p for ps in pieces for p in ps if CJK.search(p)]
+        translated = dict(zip(chinese, (options[0] for options in self._run_model(chinese))))
+        return [re.sub(r"\s+", " ", " ".join(translated.get(p, p) for p in ps)) for ps in pieces]
+
+    def _run_model(self, texts: list[str], alternatives: int = 1) -> list[list[str]]:
+        """The `alternatives` best translations of each text, best first."""
+        if not texts:
+            return []
+        batch = [self.sp_src.encode(self._normalize(t), out_type=str) for t in texts]
+        results = self.model.translate_batch(batch, beam_size=max(4, alternatives), num_hypotheses=alternatives,
+                                             max_decoding_length=256, max_batch_size=32)
+        return [[self._clean(src, self.sp_tgt.decode(h)) for h in res.hypotheses] for src, res in zip(texts, results)]
+
+    @staticmethod
+    def _clean(src: str, en: str) -> str:
+        en = _LABEL.sub("", en).strip()
+        # Short UI labels should not get a full stop: "确定" -> "OK", not "OK."
+        if en.endswith(".") and not en.endswith("..") and not src.rstrip().endswith(_SENTENCE_END):
+            en = en[:-1]
+        return en
 
 
 # ------------------------------------------------------------------------------------ worker
@@ -245,6 +303,7 @@ class Worker(threading.Thread):
         self.area, self.args, self.out, self.stop, self.paused = area, args, out, stop, paused
         self.translations: OrderedDict[str, str] = OrderedDict()
         self.ready = threading.Event()  # set once the models are loaded
+        self.grab_lock = threading.Lock()  # held by App.screenshot while the overlay is capturable
         self.failed = False
 
     def publish(self, area: dict, items: list[Item]) -> None:
@@ -286,7 +345,8 @@ class Worker(threading.Thread):
                 area = self.area  # read once: the toolbar may swap it at any time
                 if area is not prev_area:
                     prev, prev_area = None, area
-                frame = np.ascontiguousarray(np.asarray(sct.grab(area))[:, :, :3])  # BGRA -> BGR
+                with self.grab_lock:
+                    frame = np.ascontiguousarray(np.asarray(sct.grab(area))[:, :, :3])  # BGRA -> BGR
 
                 # Cheap change detection on a 1/16 sample: skip OCR while the screen is static.
                 small = frame[::4, ::4, 1].astype(np.int16)
@@ -343,8 +403,66 @@ def setup_window(hwnd: int, click_through: bool) -> bool:
     WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x20, 0x80, 0x80000, 0x08000000
     extra = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (WS_EX_TRANSPARENT | WS_EX_LAYERED if click_through else 0)
     user32.SetWindowLongW(hwnd, GWL_EXSTYLE, user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | extra)
-    WDA_EXCLUDEFROMCAPTURE = 0x11  # Windows 10 2004 or newer
-    return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+    return set_capture_excluded(hwnd, True)
+
+
+def set_capture_excluded(hwnd: int, excluded: bool) -> bool:
+    """Hide a window from (or show it to) screenshots and screen capture, including our own OCR."""
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+    WDA_NONE, WDA_EXCLUDEFROMCAPTURE = 0x0, 0x11  # exclusion needs Windows 10 2004 or newer
+    return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE))
+
+
+def wait_for_redraw(frames: int = 2) -> None:
+    """Wait until Windows has redrawn the screen, so a capture sees the latest window state."""
+    for _ in range(frames):
+        if ctypes.windll.dwmapi.DwmFlush() != 0:  # compositor unavailable: just wait a frame
+            time.sleep(0.02)
+
+
+def copy_image_to_clipboard(bgra: np.ndarray, owner_hwnd: int) -> bool:
+    """Put an image on the Windows clipboard (24-bit DIB), ready to paste with Ctrl+V."""
+    import struct
+    from ctypes import wintypes
+
+    h, w = bgra.shape[:2]
+    stride = (w * 3 + 3) & ~3  # DIB rows are padded to 4 bytes and stored bottom-up, as BGR
+    pixels = np.zeros((h, stride), np.uint8)
+    pixels[:, :w * 3] = bgra[::-1, :, :3].reshape(h, w * 3)
+    data = struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0, pixels.size, 0, 0, 0, 0) + pixels.tobytes()
+
+    kernel32, user32 = ctypes.windll.kernel32, ctypes.windll.user32
+    kernel32.GlobalAlloc.argtypes, kernel32.GlobalAlloc.restype = [ctypes.c_uint, ctypes.c_size_t], ctypes.c_void_p
+    kernel32.GlobalLock.argtypes, kernel32.GlobalLock.restype = [ctypes.c_void_p], ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes, user32.SetClipboardData.restype = [ctypes.c_uint, ctypes.c_void_p], ctypes.c_void_p
+    GMEM_MOVEABLE, CF_DIB = 0x0002, 8
+
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+    if not handle:
+        return False
+    ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+    kernel32.GlobalUnlock(handle)
+    for _ in range(20):  # another app may be holding the clipboard for a moment
+        if user32.OpenClipboard(owner_hwnd):
+            break
+        time.sleep(0.05)
+    else:
+        kernel32.GlobalFree(handle)
+        return False
+    try:
+        user32.EmptyClipboard()
+        if user32.SetClipboardData(CF_DIB, handle):
+            return True  # the clipboard owns the memory now
+        kernel32.GlobalFree(handle)
+        return False
+    finally:
+        user32.CloseClipboard()
 
 
 def keep_on_top(hwnd: int) -> None:
@@ -456,8 +574,10 @@ class Overlay:
         height = max(area["height"], self.screen_bottom - area["top"])
         self.root.geometry(f"{area['width']}x{height}+{area['left']}+{area['top']}")
         self.root.update_idletasks()  # apply now (see Toolbar.place_near)
+        self.window_height = height
         self.canvas.delete("all")
         self.items = []
+        self.content_bottom = 0.0  # lowest drawn pixel (may be below the area)
 
     def set_scale(self, scale: float) -> None:
         self.scale = round(min(FONT_SCALE_MAX, max(FONT_SCALE_MIN, scale)), 2)
@@ -528,6 +648,7 @@ class Overlay:
                 b.top += push
             blocks.extend(placed)
 
+        self.content_bottom = max((max(b.item.y1, b.bottom) for b in blocks), default=0.0)
         c = self.canvas
         c.delete("all")
         for b in blocks:  # 1) backgrounds: hide the original Chinese and make room for the English
@@ -543,11 +664,12 @@ class Overlay:
 
 class Toolbar:
     """Floating, draggable control bar: pause/resume, resize (pick a new area), font size -/+,
-    line spacing -/+, quit.
+    line spacing -/+, screenshot, quit.
     It stays on top, never takes keyboard focus away from the VM and is hidden from screen capture."""
 
     BG, BUTTON, HOVER, TEXT, BORDER = "#202124", "#303134", "#4a4c50", "#e8eaed", "#5f6368"
-    STATE_COLORS = {"loading": "#8ab4f8", "running": "#34a853", "paused": "#f9ab00"}
+    STATE_COLORS: ClassVar[dict[str, str]] = {"loading": "#8ab4f8", "running": "#34a853", "paused": "#f9ab00"}
+    SHOT_LABEL = "⎙  Screenshot"
 
     def __init__(self, app: App):
         import tkinter as tk
@@ -574,6 +696,7 @@ class Toolbar:
         self.spacing_label = tk.Label(bar, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 10), width=4)
         self.spacing_label.pack(side="left")
         self._button(bar, "↕+", lambda: app.change_spacing(+1), width=3)
+        self.shot_button = self._button(bar, self.SHOT_LABEL, app.screenshot, width=11, pad_left=8)
         self._button(bar, "✕", app.quit, width=3, hover="#c5221f", pad_left=8)
 
         for widget in (bar, grip, self.dot, self.scale_label, self.spacing_label):  # drag by non-buttons
@@ -593,8 +716,8 @@ class Toolbar:
                            bg=self.BUTTON, fg=self.TEXT, activebackground=hover or self.HOVER,
                            activeforeground=self.TEXT, relief="flat", bd=0, padx=8, pady=3,
                            highlightthickness=0, cursor="hand2")
-        b.bind("<Enter>", lambda e: b.configure(bg=hover or self.HOVER))
-        b.bind("<Leave>", lambda e: b.configure(bg=self.BUTTON))
+        b.bind("<Enter>", lambda _e: b.configure(bg=hover or self.HOVER))
+        b.bind("<Leave>", lambda _e: b.configure(bg=self.BUTTON))
         b.pack(side="left", padx=(pad_left, 2), pady=4)
         return b
 
@@ -631,6 +754,11 @@ class Toolbar:
     def show_spacing(self, spacing: float) -> None:
         self.spacing_label.configure(text=f"{spacing:.1f}×")
 
+    def flash_shot(self, ok: bool) -> None:
+        """Briefly confirm a screenshot on its button."""
+        self.shot_button.configure(text="✓  Saved" if ok else "✕  Failed")
+        self.win.after(1500, lambda: self.shot_button.configure(text=self.SHOT_LABEL))
+
 
 # --------------------------------------------------------------------------------------- app
 
@@ -642,6 +770,7 @@ class App:
         self.root, self.monitors, self.worker = root, monitors, worker
         self.results, self.stop, self.paused = results, stop, paused
         self.selecting = False
+        self.screenshot_dir = Path(args.screenshot_dir)
         self.overlay = Overlay(root, area, max(0.2, min(1.0, args.opacity)),
                                min(FONT_SCALE_MAX, max(FONT_SCALE_MIN, args.font_scale)),
                                min(LINE_SPACING_MAX, max(LINE_SPACING_MIN, args.line_spacing)),
@@ -668,6 +797,43 @@ class App:
         self.overlay.set_spacing(self.overlay.spacing + direction * LINE_SPACING_STEP)
         if self.toolbar:
             self.toolbar.show_spacing(self.overlay.spacing)
+
+    def screenshot(self) -> None:
+        """Save the area as you see it - translations included - to a PNG and copy it to the clipboard.
+        Windows' own screenshot tools can't see the overlay: it is hidden from capture so the
+        translator never reads its own English. Here we show it to capture for a moment instead,
+        while the worker is kept from capturing."""
+        import mss
+        import mss.tools
+
+        ov = self.overlay
+        area = ov.area
+        height = min(ov.window_height, max(area["height"], math.ceil(ov.content_bottom) + 2))
+        region = {"left": area["left"], "top": area["top"], "width": area["width"], "height": height}
+        try:
+            with self.worker.grab_lock:  # the worker must not capture while the overlay is capturable
+                set_capture_excluded(ov.hwnd, False)
+                try:
+                    wait_for_redraw()
+                    with mss.MSS() as sct:
+                        shot = sct.grab(region)
+                finally:
+                    set_capture_excluded(ov.hwnd, True)
+                    wait_for_redraw()
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            path, n = self.screenshot_dir / f"translation_{stamp}.png", 2
+            while path.exists():
+                path, n = self.screenshot_dir / f"translation_{stamp}_{n}.png", n + 1
+            mss.tools.to_png(shot.rgb, shot.size, output=str(path))
+            copied = copy_image_to_clipboard(np.asarray(shot), ov.hwnd)
+            print(f"Screenshot saved: {path}" + (" (and copied to the clipboard)" if copied else ""), flush=True)
+            ok = True
+        except Exception as e:  # noqa: BLE001 - a failed screenshot must never take the translator down
+            print(f"Screenshot failed: {e}", flush=True)
+            ok = False
+        if self.toolbar:
+            self.toolbar.flash_shot(ok)
 
     def quit(self) -> None:
         self.stop.set()
@@ -754,14 +920,14 @@ def select_region(root, monitors: list[dict]) -> dict | None:
             x0, x1 = sorted((sx, ex))
             y0, y1 = sorted((sy, ey))
             if x1 - x0 >= 20 and y1 - y0 >= 20:
-                state["area"] = dict(left=v["left"] + x0, top=v["top"] + y0, width=x1 - x0, height=y1 - y0)
+                state["area"] = {"left": v["left"] + x0, "top": v["top"] + y0, "width": x1 - x0, "height": y1 - y0}
         top.destroy()
 
     canvas.bind("<ButtonPress-1>", press)
     canvas.bind("<B1-Motion>", drag)
     canvas.bind("<ButtonRelease-1>", release)
-    canvas.bind("<ButtonPress-3>", lambda e: top.destroy())
-    top.bind("<Escape>", lambda e: top.destroy())
+    canvas.bind("<ButtonPress-3>", lambda _e: top.destroy())
+    top.bind("<Escape>", lambda _e: top.destroy())
     top.update()
     top.focus_force()
     root.wait_window(top)
@@ -787,6 +953,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--line-spacing", type=float, default=1.0,
                    help="starting space between translated rows, 1-3 x the text height (default 1)")
     p.add_argument("--model", default=str(DEFAULT_MODEL), help="CTranslate2 translation model folder")
+    p.add_argument("--screenshot-dir", default=str(DEFAULT_SCREENSHOT_DIR),
+                   help="where the toolbar's Screenshot button saves PNGs (default: ./screenshots)")
     p.add_argument("--no-toolbar", action="store_true", help="hide the floating toolbar (hotkeys still work)")
     p.add_argument("--no-overlay", action="store_true", help="don't draw on screen, only print translations")
     return p.parse_args()
@@ -827,7 +995,7 @@ def main() -> None:
             left, top, width, height = (int(v) for v in args.region.split(","))
         except ValueError:
             sys.exit("--region must look like LEFT,TOP,WIDTH,HEIGHT, e.g. 100,80,1280,720")
-        area = dict(left=left, top=top, width=width, height=height)
+        area = {"left": left, "top": top, "width": width, "height": height}
     else:
         if not 1 <= args.monitor < len(monitors):
             sys.exit(f"--monitor must be between 1 and {len(monitors) - 1}")

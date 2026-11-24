@@ -60,6 +60,7 @@ A small floating toolbar appears just above the translated area (drag it anywher
 | `⤢ Resize` | pick a new area: the screen dims, drag a new rectangle (`Esc` keeps the old one) |
 | `A−` `100%` `A+` | translation font size, 50%–300%. Above 100% the English may extend past the original text or wrap |
 | `↕−` `1.0×` `↕+` | line spacing: distance between translated rows (and wrapped lines), 1.0×–3.0× the text height |
+| `⎙ Screenshot` | picture of the area as you see it, translations included: copied to the clipboard (paste with `Ctrl+V`) and saved as a PNG in `screenshots/` |
 | `✕` | quit |
 
 Translations never cover each other: when a bigger font, a wrapped phrase or more line spacing
@@ -74,11 +75,12 @@ so table columns stay aligned). Rows pushed past the bottom of the area keep goi
 If the VM window has keyboard focus it may capture the hotkeys; use the toolbar instead.
 
 Other options: `--font-scale` (starting font size, e.g. `1.5`), `--line-spacing` (starting line
-spacing, e.g. `1.5`), `--no-toolbar`, `--interval`
+spacing, e.g. `1.5`), `--screenshot-dir` (where screenshots are saved), `--no-toolbar`, `--interval`
 (seconds between screen checks, default 0.25), `--min-score` (OCR confidence, default 0.6),
 `--opacity` (0.2–1). See `--help`.
 
-The overlay and toolbar are hidden from screenshots and screen sharing (that is how the
+Windows' own screenshot tools (`PrtScn`, `Win+Shift+S`) and screen sharing only see the original
+Chinese: the overlay and toolbar are hidden from capture (that is how the
 translator avoids reading its own English).
 
 ## How it works
@@ -87,6 +89,8 @@ translator avoids reading its own English).
 2. Detects text boxes; only boxes with new pixels go through text recognition (cached).
    Pieces of one line that the detector split apart are joined back together.
 3. Translates new Chinese lines (cached), using `glossary.txt` first for exact matches.
+   Only the Chinese is translated: anything else in a line (product names like `gitlab`, code,
+   paths, URLs, e-mails, version numbers) is kept exactly as written.
 4. Draws each translation over its original line, in a window that is click-through and
    hidden from screen capture (so it never reads its own English).
 
